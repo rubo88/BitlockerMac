@@ -286,8 +286,11 @@ func unlock(_ part: Locked, key: String, write: Bool) -> Result<String, UnlockEr
 
 /// Monta en lectura y escritura con ntfs-3g el NTFS que dislocker ha dejado en `file`.
 func mountNTFS(_ id: String, file: String, label: String) -> Result<String, UnlockError> {
-    // las comas separan opciones de -o, y / y : no valen en un nombre de volumen
-    var name = label.replacingOccurrences(of: #"[/:,]"#, with: "-", options: .regularExpression)
+    // las comas separan opciones de -o, y / y : no valen en un nombre de volumen. Además macFUSE 5.5
+    // no monta en /Volumes si el nombre lleva caracteres no ASCII (falla en silencio): fuera tildes y eñes.
+    var name = (label.applyingTransform(.stripDiacritics, reverse: false) ?? label)
+        .replacingOccurrences(of: #"[/:,]"#, with: "-", options: .regularExpression)
+        .replacingOccurrences(of: #"[^\x20-\x7E]"#, with: "_", options: .regularExpression)
     if name.isEmpty { name = "BitLocker" }
     var mp = "/Volumes/" + name, n = 2
     while FileManager.default.fileExists(atPath: mp) {
@@ -296,9 +299,17 @@ func mountNTFS(_ id: String, file: String, label: String) -> Result<String, Unlo
     }
     // user_xattr: sin él macOS no puede guardar atributos extendidos y `cp`/Finder fallan al copiar
     let r = run(ntfs3gPath, [file, mp, "-o", "backend=fskit,user_xattr,volname=\(name)"])
+    // ntfs-3g vuelve antes de que el volumen aparezca montado
+    var tries = 0
+    while r.status == 0 && !isMounted(mp) && tries < 20 {
+        Thread.sleep(forTimeInterval: 0.5)
+        tries += 1
+    }
     guard r.status == 0, isMounted(mp) else {
         let msg = (r.err + r.out).trimmingCharacters(in: .whitespacesAndNewlines)
-        log("ntfs-3g: código \(r.status) \(msg)")
+        log("ntfs-3g: código \(r.status) \(msg.isEmpty ? "(no aparece montado en \(mp))" : msg)")
+        run("/usr/bin/pkill", ["-f", "\(ntfs3gPath) \(file)"])
+        Thread.sleep(forTimeInterval: 1)
         run("/sbin/umount", [mountDir(id)])
         if msg.localizedCaseInsensitiveContains("hibernat") || msg.localizedCaseInsensitiveContains("unclean")
             || msg.localizedCaseInsensitiveContains("Windows cache") {
