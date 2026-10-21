@@ -397,20 +397,23 @@ final class MenuController: NSObject, NSMenuDelegate {
         item.button?.image = driveIcon(open: !opened.isEmpty)
     }
 
-    /// Disco externo con un candado (cerrado o abierto) en la esquina: macOS no trae ese símbolo.
+    /// Disco externo grande con un candado (cerrado o abierto) encima: macOS no trae ese símbolo.
     func driveIcon(open: Bool) -> NSImage? {
         guard let drive = NSImage(systemSymbolName: "externaldrive", accessibilityDescription: "BitLocker")?
-                .withSymbolConfiguration(.init(pointSize: 13, weight: .regular)),
+                .withSymbolConfiguration(.init(pointSize: 24, weight: .regular)),
               let lock = NSImage(systemSymbolName: open ? "lock.open.fill" : "lock.fill", accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold)) else { return nil }
-        let d = drive.size, l = lock.size
-        let size = NSSize(width: d.width + l.width * 0.75, height: d.height + l.height * 0.55)
+        // el disco se escala a 21 pt de alto para caber en la barra (22 pt); el candado mantiene su tamaño
+        let h: CGFloat = 21
+        let size = NSSize(width: (drive.size.width * h / drive.size.height).rounded(), height: h)
+        let l = lock.size
         let img = NSImage(size: size, flipped: false) { _ in
-            drive.draw(in: NSRect(x: 0, y: size.height - d.height, width: d.width, height: d.height))
-            let lr = NSRect(x: size.width - l.width, y: 0, width: l.width, height: l.height)
-            // hueco alrededor del candado para que no se confunda con el contorno del disco
+            drive.draw(in: NSRect(origin: .zero, size: size))
+            let lr = NSRect(x: (size.width - l.width) / 2, y: (size.height - l.height) / 2 - 0.5,
+                            width: l.width, height: l.height)
+            // hueco fino alrededor del candado para que no se funda con el contorno del disco
             NSGraphicsContext.current?.compositingOperation = .destinationOut
-            NSBezierPath(roundedRect: lr.insetBy(dx: -1, dy: -1), xRadius: 2.5, yRadius: 2.5).fill()
+            NSBezierPath(roundedRect: lr.insetBy(dx: -0.6, dy: -0.6), xRadius: 2.5, yRadius: 2.5).fill()
             NSGraphicsContext.current?.compositingOperation = .sourceOver
             lock.draw(in: lr)
             return true
