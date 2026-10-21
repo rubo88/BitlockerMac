@@ -43,8 +43,9 @@ El instalador:
 
 1. comprueba los requisitos;
 2. instala con Homebrew lo que falte: macFUSE (te pedirá la contraseña del Mac), dislocker y ntfs-3g;
-3. compila la app y la instala en `~/.local/bin/BitlockerMac`;
-4. registra un LaunchAgent para que arranque al iniciar sesión.
+3. si tu macFUSE es anterior a la 5.5, te pregunta si quieres actualizarla para poder escribir: con Homebrew si ya tiene la 5.5 estable, o si no la 5.5.0 de prueba desde GitHub, tras comprobar su suma, la firma del desarrollador y la notarización de Apple. Por defecto no la instala;
+4. compila la app y la instala en `~/.local/bin/BitlockerMac`;
+5. registra un LaunchAgent para que arranque al iniciar sesión.
 
 Vuelve a ejecutarlo cuando quieras para actualizar.
 

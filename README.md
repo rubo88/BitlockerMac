@@ -43,8 +43,9 @@ The installer:
 
 1. checks the requirements;
 2. installs whatever is missing with Homebrew: macFUSE (it will ask for your Mac password), dislocker and ntfs-3g;
-3. builds the app and installs it to `~/.local/bin/BitlockerMac`;
-4. registers a LaunchAgent so it starts at login.
+3. if your macFUSE is older than 5.5, asks whether to update it so drives can be written to: through Homebrew if it already has a stable 5.5, otherwise the 5.5.0 prerelease from GitHub, after checking its checksum, the developer's signature and Apple's notarization. The default answer is no;
+4. builds the app and installs it to `~/.local/bin/BitlockerMac`;
+5. registers a LaunchAgent so it starts at login.
 
 Run it again at any time to update.
 
