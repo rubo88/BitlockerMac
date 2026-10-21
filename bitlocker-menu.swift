@@ -1,0 +1,529 @@
+// bitlocker-menu: icono en la barra de menús para abrir discos externos cifrados con BitLocker.
+//
+// Usa dislocker con macFUSE en modo FSKit (sin extensión del kernel ni bajar la seguridad del Mac)
+// y monta el resultado en solo lectura con el soporte NTFS/exFAT de macOS.
+//
+//   1. Con la contraseña del Mac, la partición cifrada pasa a ser legible (solo lectura) por el
+//      usuario. macOS lo deshace solo al desconectar el disco.
+//   2. dislocker-fuse se ejecuta como el usuario (FSKit solo funciona así) y deja en
+//      ~/Library/Caches/bitlocker-menu/<diskXsY>/dislocker-file el volumen descifrado.
+//   3. hdiutil adjunta ese fichero en solo lectura y macOS lo monta en /Volumes.
+//
+// La clave nunca va en los argumentos (los ve cualquiera con `ps`) ni en ningún registro:
+// la contraseña va por la variable DISLOCKER_PASSWORD y la clave de recuperación se teclea
+// en un pseudoterminal sin eco.
+
+import AppKit
+import DiskArbitration
+
+let version = "1.0.0"
+let dislockerPath = "/opt/homebrew/bin/dislocker-fuse"
+let home = NSHomeDirectory()
+// macFUSE 5.4 (FSKit) no monta en rutas con espacios: por eso Caches y no Application Support
+let baseDir = home + "/Library/Caches/bitlocker-menu"
+let logPath = home + "/Library/Logs/bitlocker-menu.log"
+let windowsContents: Set<String> = ["Microsoft Basic Data", "Windows_NTFS", "Windows_FAT_32", "DOS_FAT_32"]
+
+let stampFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    return f
+}()
+
+func log(_ s: String) {
+    print("\(stampFormatter.string(from: Date())) \(s)")
+    fflush(stdout)
+}
+
+// MARK: - Procesos
+
+final class Buffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    func append(_ d: Data) { lock.lock(); data.append(d); lock.unlock() }
+    var string: String { lock.lock(); defer { lock.unlock() }; return String(decoding: data, as: UTF8.self) }
+}
+
+struct Output { var status: Int32; var out: String; var err: String }
+
+/// Ejecuta un programa y espera a que acabe. `input` se escribe en su entrada un segundo después
+/// de arrancar (deja tiempo a `stty -echo` dentro del pseudoterminal) y la entrada sigue abierta
+/// hasta el final: si `script` viera fin de fichero, colgaría el terminal antes de tiempo.
+@discardableResult
+func run(_ exe: String, _ args: [String], env: [String: String] = [:],
+         input: String? = nil, timeout: TimeInterval = 120) -> Output {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: exe)
+    p.arguments = args
+    if !env.isEmpty { p.environment = ProcessInfo.processInfo.environment.merging(env) { $1 } }
+    let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
+    p.standardInput = input == nil ? FileHandle.nullDevice : inPipe
+    p.standardOutput = outPipe
+    p.standardError = errPipe
+    let out = Buffer(), err = Buffer()
+    for (pipe, buf) in [(outPipe, out), (errPipe, err)] {
+        pipe.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil } else { buf.append(d) }
+        }
+    }
+    let done = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in done.signal() }
+    do { try p.run() } catch { return Output(status: -1, out: "", err: "\(error)") }
+    if let input {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+            try? inPipe.fileHandleForWriting.write(contentsOf: Data(input.utf8))
+        }
+    }
+    var timedOut = false
+    if done.wait(timeout: .now() + timeout) == .timedOut {
+        timedOut = true
+        p.terminate()
+        done.wait()
+    }
+    if input != nil { try? inPipe.fileHandleForWriting.close() }
+    Thread.sleep(forTimeInterval: 0.1)
+    outPipe.fileHandleForReading.readabilityHandler = nil
+    errPipe.fileHandleForReading.readabilityHandler = nil
+    return Output(status: timedOut ? -2 : p.terminationStatus, out: out.string, err: err.string)
+}
+
+func plist(_ s: String) -> Any? {
+    try? PropertyListSerialization.propertyList(from: Data(s.utf8), format: nil)
+}
+
+// MARK: - Discos
+
+/// Partición de Windows sin montar en un disco externo: candidata a ser BitLocker.
+struct Locked { let id: String; let size: Int64; let media: String }
+/// Volumen descifrado y adjuntado por esta app.
+struct Opened { let id: String; let dev: String; let mount: String? }
+
+func sizeText(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) }
+func mountDir(_ id: String) -> String { baseDir + "/" + id }
+func physicalDisk(_ id: String) -> String {
+    id.replacingOccurrences(of: #"s\d+$"#, with: "", options: .regularExpression)
+}
+
+func openedVolumes() -> [Opened] {
+    let r = run("/usr/bin/hdiutil", ["info", "-plist"])
+    guard let d = plist(r.out) as? [String: Any], let images = d["images"] as? [[String: Any]] else { return [] }
+    return images.compactMap { img in
+        guard let path = img["image-path"] as? String, path.hasPrefix(baseDir + "/") else { return nil }
+        let id = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
+        let ents = img["system-entities"] as? [[String: Any]] ?? []
+        guard let dev = ents.compactMap({ $0["dev-entry"] as? String }).sorted().first else { return nil }
+        return Opened(id: id, dev: dev, mount: ents.compactMap { $0["mount-point"] as? String }.first)
+    }
+}
+
+func lockedPartitions(excluding opened: [Opened]) -> [Locked] {
+    let r = run("/usr/sbin/diskutil", ["list", "-plist", "external", "physical"])
+    guard let d = plist(r.out) as? [String: Any],
+          let disks = d["AllDisksAndPartitions"] as? [[String: Any]] else { return [] }
+    let open = Set(opened.map(\.id))
+    var res: [Locked] = []
+    for disk in disks {
+        let parts = (disk["Partitions"] as? [[String: Any]] ?? []).filter { p in
+            guard let id = p["DeviceIdentifier"] as? String, !open.contains(id) else { return false }
+            let mounted = !((p["MountPoint"] as? String) ?? "").isEmpty
+            return !mounted && windowsContents.contains(p["Content"] as? String ?? "")
+        }
+        if parts.isEmpty { continue }
+        let info = plist(run("/usr/sbin/diskutil", ["info", "-plist", disk["DeviceIdentifier"] as? String ?? ""]).out)
+        let media = ((info as? [String: Any])?["MediaName"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+        for p in parts {
+            res.append(Locked(id: p["DeviceIdentifier"] as! String,
+                              size: (p["Size"] as? NSNumber)?.int64Value ?? 0, media: media))
+        }
+    }
+    return res
+}
+
+func isMounted(_ dir: String) -> Bool {
+    run("/sbin/mount", []).out.contains(" on \(dir) (")
+}
+
+// MARK: - Desbloquear y expulsar
+
+/// Hace la partición legible por el usuario. Pide la contraseña del Mac (diálogo del sistema);
+/// tiene que ir en el hilo principal. Devuelve nil si todo va bien o el mensaje de error.
+func grantRead(_ id: String) -> String? {
+    if FileManager.default.isReadableFile(atPath: "/dev/r" + id) { return nil }
+    let user = NSUserName()
+    guard id.range(of: #"^disk\d+s\d+$"#, options: .regularExpression) != nil,
+          user.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression) != nil else {
+        return "Identificador de disco o usuario inesperado."
+    }
+    let cmd = "/usr/sbin/chown \(user) /dev/\(id) /dev/r\(id) && /bin/chmod 400 /dev/\(id) /dev/r\(id)"
+    let prompt = "bitlocker-menu necesita tu contraseña del Mac para leer el disco cifrado (solo lectura, hasta que lo desconectes)."
+    var err: NSDictionary?
+    NSAppleScript(source: "do shell script \"\(cmd)\" with administrator privileges with prompt \"\(prompt)\"")?
+        .executeAndReturnError(&err)
+    guard let err else {
+        log("Permiso de lectura concedido en \(id)")
+        return nil
+    }
+    let code = err[NSAppleScript.errorNumber] as? Int ?? 0
+    log("Permiso de lectura en \(id) fallido (\(code))")
+    return code == -128 ? "Cancelado." : "No se ha podido dar permiso de lectura al disco (\(code))."
+}
+
+func isRecoveryKey(_ key: String) -> Bool {
+    let digits = key.filter { $0.isASCII && $0.isNumber }
+    let rest = key.filter { !($0.isASCII && $0.isNumber) && $0 != "-" && $0 != " " }
+    return digits.count == 48 && rest.isEmpty
+}
+
+/// Descifra y monta. Devuelve el punto de montaje o el mensaje de error. Va fuera del hilo principal.
+func unlock(_ part: Locked, key: String) -> Result<String, UnlockError> {
+    let dir = mountDir(part.id), dlog = dir + ".log"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    if isMounted(dir) { run("/sbin/umount", [dir]) }   // restos de un intento anterior
+    try? FileManager.default.removeItem(atPath: dlog)
+
+    let head = ["-r", "-V", "/dev/" + part.id]
+    let tail = ["-l", dlog, "--", dir, "-o", "backend=fskit"]
+    let r: Output
+    if isRecoveryKey(key) {
+        // dislocker solo lee la clave de recuperación desde un terminal: se le da uno sin eco.
+        // Su salida repite los dígitos, así que no se guarda en ningún sitio.
+        log("Desbloqueando \(part.id) con clave de recuperación")
+        let digits = String(key.filter { $0.isASCII && $0.isNumber })
+        r = run("/usr/bin/script", ["-q", "/dev/null", "/bin/sh", "-c", "stty -echo; exec \"$0\" \"$@\"",
+                                    dislockerPath] + head + ["-p"] + tail, input: digits + "\n")
+    } else {
+        log("Desbloqueando \(part.id) con contraseña")
+        r = run(dislockerPath, head + ["-u"] + tail, env: ["DISLOCKER_PASSWORD": key])
+    }
+    let dl = (try? String(contentsOfFile: dlog, encoding: .utf8)) ?? ""
+    if !dl.isEmpty { log("dislocker: " + dl.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    if r.status != 0 {
+        log("dislocker terminó con código \(r.status)")
+        if isMounted(dir) { run("/sbin/umount", [dir]) }
+        if (r.out + r.err).contains("extension not enabled") { return .failure(.extensionDisabled) }
+        if dl.contains("VMK") { return .failure(.wrongKey) }
+        if r.status == -2 { return .failure(.other("dislocker no ha respondido a tiempo.")) }
+        return .failure(.other("dislocker ha fallado (código \(r.status)). Detalles en el registro."))
+    }
+
+    let file = dir + "/dislocker-file"
+    var tries = 0
+    while !FileManager.default.fileExists(atPath: file) && tries < 50 {
+        Thread.sleep(forTimeInterval: 0.2)
+        tries += 1
+    }
+    guard FileManager.default.fileExists(atPath: file) else {
+        run("/sbin/umount", [dir])
+        return .failure(.other("dislocker no ha creado el volumen descifrado."))
+    }
+    let a = run("/usr/bin/hdiutil", ["attach", "-readonly", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", file])
+    let ents = ((plist(a.out) as? [String: Any])?["system-entities"] as? [[String: Any]]) ?? []
+    guard a.status == 0, let mount = ents.compactMap({ $0["mount-point"] as? String }).first else {
+        log("hdiutil attach: código \(a.status) \(a.err.trimmingCharacters(in: .whitespacesAndNewlines))")
+        for dev in ents.compactMap({ $0["dev-entry"] as? String }).sorted().prefix(1) {
+            run("/usr/bin/hdiutil", ["detach", dev])
+        }
+        run("/sbin/umount", [dir])
+        return .failure(.other("Descifrado, pero macOS no reconoce el sistema de archivos del disco."))
+    }
+    log("\(part.id) montado en \(mount)")
+    return .success(mount)
+}
+
+enum UnlockError: Error {
+    case wrongKey, extensionDisabled, other(String)
+    var message: String {
+        switch self {
+        case .wrongKey: return "La clave no es correcta (o la partición no es BitLocker)."
+        case .extensionDisabled:
+            return "La extensión de macFUSE está desactivada. Actívala en Ajustes del Sistema → General → Ítems de inicio y extensiones → Extensiones del sistema de archivos."
+        case .other(let s): return s
+        }
+    }
+}
+
+/// Desmonta el volumen, cierra dislocker y expulsa el disco físico. Devuelve nil o el error.
+func eject(_ o: Opened) -> String? {
+    let d = run("/usr/bin/hdiutil", ["detach", o.dev])
+    if d.status != 0 {
+        log("hdiutil detach \(o.dev): \(d.err.trimmingCharacters(in: .whitespacesAndNewlines))")
+        return "No se ha podido expulsar: puede que haya algún archivo del disco abierto."
+    }
+    run("/sbin/umount", [mountDir(o.id)])
+    let e = run("/usr/sbin/diskutil", ["eject", physicalDisk(o.id)])
+    log("\(o.id) expulsado (disco físico: \(e.status == 0 ? "ok" : e.err.trimmingCharacters(in: .whitespacesAndNewlines)))")
+    return e.status == 0 ? nil : "El volumen se ha cerrado, pero el disco físico no se ha podido expulsar."
+}
+
+// MARK: - Ventana de desbloqueo
+
+final class UnlockPanel: NSObject, NSWindowDelegate {
+    let part: Locked
+    let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 200),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    let field = NSSecureTextField()
+    let status = NSTextField(wrappingLabelWithString: "")
+    let spinner = NSProgressIndicator()
+    let unlockButton = NSButton(title: "Desbloquear", target: nil, action: nil)
+    let cancelButton = NSButton(title: "Cancelar", target: nil, action: nil)
+    var onClose: (() -> Void)?
+
+    init(part: Locked) {
+        self.part = part
+        super.init()
+        window.title = "Desbloquear disco BitLocker"
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.delegate = self
+
+        let title = NSTextField(labelWithString: part.media.isEmpty ? "Disco externo" : part.media)
+        title.font = .boldSystemFont(ofSize: NSFont.systemFontSize + 1)
+        let sub = NSTextField(labelWithString: "\(part.id) · \(sizeText(part.size)) · se abrirá en solo lectura")
+        sub.textColor = .secondaryLabelColor
+        field.placeholderString = "Contraseña o clave de recuperación (48 dígitos)"
+        let note = NSTextField(wrappingLabelWithString:
+            "La primera vez tras conectar el disco, macOS te pedirá también tu contraseña del Mac.")
+        note.textColor = .secondaryLabelColor
+        note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        status.textColor = .systemRed
+        status.isHidden = true
+        for l in [note, status] { l.preferredMaxLayoutWidth = 380 }
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
+
+        unlockButton.target = self; unlockButton.action = #selector(doUnlock)
+        unlockButton.keyEquivalent = "\r"
+        cancelButton.target = self; cancelButton.action = #selector(cancel)
+        cancelButton.keyEquivalent = "\u{1b}"
+        let buttons = NSStackView(views: [spinner, NSView(), cancelButton, unlockButton])
+        buttons.orientation = .horizontal
+
+        let stack = NSStackView(views: [title, sub, field, note, status, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.setCustomSpacing(4, after: title)
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        NSLayoutConstraint.activate([
+            field.widthAnchor.constraint(equalToConstant: 380),
+            buttons.widthAnchor.constraint(equalTo: field.widthAnchor),
+        ])
+        window.contentView = stack
+        window.setContentSize(stack.fittingSize)
+    }
+
+    func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(field)
+    }
+
+    func setBusy(_ busy: Bool, _ text: String? = nil) {
+        field.isEnabled = !busy
+        unlockButton.isEnabled = !busy
+        busy ? spinner.startAnimation(nil) : spinner.stopAnimation(nil)
+        showStatus(text, error: false)
+    }
+
+    func showStatus(_ text: String?, error: Bool) {
+        status.stringValue = text ?? ""
+        status.textColor = error ? .systemRed : .secondaryLabelColor
+        status.isHidden = text == nil
+        window.setContentSize(window.contentView!.fittingSize)
+    }
+
+    @objc func doUnlock() {
+        let key = field.stringValue
+        if key.isEmpty { return }
+        setBusy(true, "Esperando permiso…")
+        if let e = grantRead(part.id) {
+            setBusy(false)
+            showStatus(e, error: true)
+            return
+        }
+        setBusy(true, "Descifrando… puede tardar unos segundos.")
+        let part = self.part
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = unlock(part, key: key)
+            DispatchQueue.main.async {
+                self.setBusy(false)
+                switch res {
+                case .success(let mount):
+                    self.field.stringValue = ""
+                    self.window.close()
+                    NSWorkspace.shared.open(URL(fileURLWithPath: mount))
+                case .failure(let e):
+                    self.showStatus(e.message, error: true)
+                    self.window.makeFirstResponder(self.field)
+                    self.field.selectText(nil)
+                }
+                controller?.scheduleRefresh()
+            }
+        }
+    }
+
+    @objc func cancel() { window.close() }
+
+    func windowWillClose(_ notification: Notification) {
+        field.stringValue = ""
+        onClose?()
+    }
+}
+
+// MARK: - Barra de menús
+
+final class MenuController: NSObject, NSMenuDelegate {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let menu = NSMenu()
+    var locked: [Locked] = []
+    var opened: [Opened] = []
+    var panels: [String: UnlockPanel] = [:]
+    var pending: DispatchWorkItem?
+
+    override init() {
+        super.init()
+        item.button?.toolTip = "BitLocker"
+        menu.delegate = self
+        menu.autoenablesItems = false
+        item.menu = menu
+        setIcon()
+        scheduleRefresh()
+    }
+
+    func setIcon() {
+        let img = NSImage(systemSymbolName: opened.isEmpty ? "lock" : "lock.open",
+                          accessibilityDescription: "BitLocker")
+        img?.isTemplate = true
+        item.button?.image = img
+    }
+
+    /// Relee los discos en segundo plano. Se llama al conectar o desconectar discos y tras cada acción.
+    func scheduleRefresh() {
+        pending?.cancel()
+        let work = DispatchWorkItem {
+            DispatchQueue.global(qos: .utility).async {
+                let o = openedVolumes()
+                let l = lockedPartitions(excluding: o)
+                DispatchQueue.main.async {
+                    self.opened = o
+                    self.locked = l
+                    self.setIcon()
+                }
+            }
+        }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        if !FileManager.default.isExecutableFile(atPath: dislockerPath) {
+            add("Falta dislocker: brew install gromgit/fuse/dislocker-mac", nil, nil).isEnabled = false
+            menu.addItem(.separator())
+        }
+        if !opened.isEmpty {
+            menu.addItem(.sectionHeader(title: "Discos abiertos"))
+            for o in opened {
+                let name = o.mount.map { URL(fileURLWithPath: $0).lastPathComponent } ?? o.id
+                add("Abrir «\(name)»", #selector(openInFinder(_:)), o.mount, symbol: "folder").isEnabled = o.mount != nil
+                add("Expulsar «\(name)»", #selector(ejectItem(_:)), o.id, symbol: "eject")
+            }
+            menu.addItem(.separator())
+        }
+        menu.addItem(.sectionHeader(title: "Discos BitLocker cerrados"))
+        if locked.isEmpty {
+            add("No hay ningún disco cifrado conectado", nil, nil).isEnabled = false
+        }
+        for p in locked {
+            let name = p.media.isEmpty ? p.id : p.media
+            add("Desbloquear \(name) · \(sizeText(p.size))…", #selector(unlockItem(_:)), p.id, symbol: "key")
+        }
+        menu.addItem(.separator())
+        add("Ver registro", #selector(showLog), nil)
+        add("Salir", #selector(quit), nil)
+        scheduleRefresh()
+    }
+
+    @discardableResult
+    func add(_ title: String, _ action: Selector?, _ obj: Any?, symbol: String? = nil) -> NSMenuItem {
+        let mi = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        mi.target = self
+        mi.representedObject = obj
+        if let symbol { mi.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
+        menu.addItem(mi)
+        return mi
+    }
+
+    @objc func unlockItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let part = locked.first(where: { $0.id == id }) else { return }
+        if let p = panels[id] { p.show(); return }
+        let p = UnlockPanel(part: part)
+        p.onClose = { [weak self] in self?.panels[id] = nil }
+        panels[id] = p
+        p.show()
+    }
+
+    @objc func openInFinder(_ sender: NSMenuItem) {
+        if let m = sender.representedObject as? String { NSWorkspace.shared.open(URL(fileURLWithPath: m)) }
+    }
+
+    @objc func ejectItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let o = opened.first(where: { $0.id == id }) else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let err = eject(o)
+            DispatchQueue.main.async {
+                self.scheduleRefresh()
+                guard let err else { return }
+                let alert = NSAlert()
+                alert.messageText = "No se ha podido expulsar el disco"
+                alert.informativeText = err
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }
+        }
+    }
+
+    @objc func showLog() { NSWorkspace.shared.open(URL(fileURLWithPath: logPath)) }
+    @objc func quit() { NSApp.terminate(nil) }
+}
+
+// Sin menú principal, una app sin icono en el Dock no recibe ⌘V en el campo de la clave.
+func installEditMenu() {
+    let main = NSMenu(), editItem = NSMenuItem(), edit = NSMenu(title: "Edit")
+    edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    edit.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+    editItem.submenu = edit
+    main.addItem(editItem)
+    NSApp.mainMenu = main
+}
+
+func watchDisks() {
+    guard let session = DASessionCreate(kCFAllocatorDefault) else { return }
+    DARegisterDiskAppearedCallback(session, nil, { _, _ in controller?.scheduleRefresh() }, nil)
+    DARegisterDiskDisappearedCallback(session, nil, { _, _ in controller?.scheduleRefresh() }, nil)
+    DARegisterDiskDescriptionChangedCallback(session, nil, nil, { _, _, _ in controller?.scheduleRefresh() }, nil)
+    DASessionScheduleWithRunLoop(session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+    daSession = session
+}
+
+var controller: MenuController?
+var daSession: DASession?
+
+if CommandLine.arguments.dropFirst().first == "version" {
+    print("bitlocker-menu \(version)")
+    exit(0)
+}
+signal(SIGPIPE, SIG_IGN)   // escribir la clave a un proceso que ya ha terminado no debe tumbar la app
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)   // sin icono en el Dock
+installEditMenu()
+log("bitlocker-menu \(version) arrancando")
+controller = MenuController()
+watchDisks()
+app.run()
