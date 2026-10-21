@@ -146,8 +146,12 @@ func isMounted(_ dir: String) -> Bool {
 
 // MARK: - Desbloquear y expulsar
 
-/// Hace la partición legible por el usuario. Pide la contraseña del Mac (diálogo del sistema);
-/// tiene que ir en el hilo principal. Devuelve nil si todo va bien o el mensaje de error.
+/// Hace la partición legible por el usuario. Pide la contraseña del Mac.
+/// Va fuera del hilo principal. Devuelve nil si todo va bien o el mensaje de error.
+///
+/// Usa `sudo -A` con esta misma app como ventana de contraseña (modo `askpass`). No sirve
+/// `do shell script … with administrator privileges`: macOS le deniega el chown de /dev
+/// ("Operation not permitted") aunque la contraseña sea correcta.
 func grantRead(_ id: String) -> String? {
     if FileManager.default.isReadableFile(atPath: "/dev/r" + id) { return nil }
     let user = NSUserName()
@@ -156,17 +160,37 @@ func grantRead(_ id: String) -> String? {
         return "Identificador de disco o usuario inesperado."
     }
     let cmd = "/usr/sbin/chown \(user) /dev/\(id) /dev/r\(id) && /bin/chmod 400 /dev/\(id) /dev/r\(id)"
-    let prompt = "bitlocker-menu necesita tu contraseña del Mac para leer el disco cifrado (solo lectura, hasta que lo desconectes)."
-    var err: NSDictionary?
-    NSAppleScript(source: "do shell script \"\(cmd)\" with administrator privileges with prompt \"\(prompt)\"")?
-        .executeAndReturnError(&err)
-    guard let err else {
+    let me = Bundle.main.executablePath ?? CommandLine.arguments[0]
+    let r = run("/usr/bin/sudo", ["-A", "/bin/sh", "-c", cmd],
+                env: ["SUDO_ASKPASS": me, "BITLOCKER_MENU_ASKPASS": "1"], timeout: 300)
+    if r.status == 0 {
         log("Permiso de lectura concedido en \(id)")
         return nil
     }
-    let code = err[NSAppleScript.errorNumber] as? Int ?? 0
-    log("Permiso de lectura en \(id) fallido (\(code))")
-    return code == -128 ? "Cancelado." : "No se ha podido dar permiso de lectura al disco (\(code))."
+    let msg = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
+    log("Permiso de lectura en \(id) fallido (\(r.status)): \(msg)")
+    if msg.contains("no password was provided") || msg.contains("no askpass") { return "Cancelado." }
+    if msg.contains("incorrect password") { return "Contraseña del Mac incorrecta." }
+    return "No se ha podido dar permiso de lectura al disco: \(msg)"
+}
+
+/// Modo `askpass` para `sudo -A`: pide la contraseña del Mac y la escribe por la salida estándar.
+func askpass() -> Never {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    installEditMenu()
+    let alert = NSAlert()
+    alert.messageText = "Contraseña del Mac"
+    alert.informativeText = "bitlocker-menu la necesita para poder leer el disco cifrado (solo lectura, hasta que lo desconectes)."
+    alert.addButton(withTitle: "Aceptar")
+    alert.addButton(withTitle: "Cancelar")
+    let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+    alert.accessoryView = field
+    alert.window.initialFirstResponder = field
+    NSApp.activate(ignoringOtherApps: true)
+    guard alert.runModal() == .alertFirstButtonReturn else { exit(1) }
+    print(field.stringValue)
+    exit(0)
 }
 
 func isRecoveryKey(_ key: String) -> Bool {
@@ -339,14 +363,16 @@ final class UnlockPanel: NSObject, NSWindowDelegate {
         let key = field.stringValue
         if key.isEmpty { return }
         setBusy(true, "Esperando permiso…")
-        if let e = grantRead(part.id) {
-            setBusy(false)
-            showStatus(e, error: true)
-            return
-        }
-        setBusy(true, "Descifrando… puede tardar unos segundos.")
         let part = self.part
         DispatchQueue.global(qos: .userInitiated).async {
+            if let e = grantRead(part.id) {
+                DispatchQueue.main.async {
+                    self.setBusy(false)
+                    self.showStatus(e, error: true)
+                }
+                return
+            }
+            DispatchQueue.main.async { self.setBusy(true, "Descifrando… puede tardar unos segundos.") }
             let res = unlock(part, key: key)
             DispatchQueue.main.async {
                 self.setBusy(false)
@@ -538,6 +564,8 @@ func watchDisks() {
 var controller: MenuController?
 var daSession: DASession?
 
+// sudo llama al askpass con su propio texto («Password:») como argumento: se reconoce por el entorno
+if ProcessInfo.processInfo.environment["BITLOCKER_MENU_ASKPASS"] == "1" { askpass() }
 if CommandLine.arguments.dropFirst().first == "version" {
     print("bitlocker-menu \(version)")
     exit(0)
