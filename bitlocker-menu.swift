@@ -400,17 +400,17 @@ final class MenuController: NSObject, NSMenuDelegate {
     /// Disco externo con un candado (cerrado o abierto) en la esquina: macOS no trae ese símbolo.
     func driveIcon(open: Bool) -> NSImage? {
         guard let drive = NSImage(systemSymbolName: "externaldrive", accessibilityDescription: "BitLocker")?
-                .withSymbolConfiguration(.init(pointSize: 14, weight: .regular)),
+                .withSymbolConfiguration(.init(pointSize: 13, weight: .regular)),
               let lock = NSImage(systemSymbolName: open ? "lock.open.fill" : "lock.fill", accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(pointSize: 8.5, weight: .semibold)) else { return nil }
+                .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold)) else { return nil }
         let d = drive.size, l = lock.size
-        let size = NSSize(width: d.width + l.width * 0.6, height: d.height + l.height * 0.45)
+        let size = NSSize(width: d.width + l.width * 0.75, height: d.height + l.height * 0.55)
         let img = NSImage(size: size, flipped: false) { _ in
             drive.draw(in: NSRect(x: 0, y: size.height - d.height, width: d.width, height: d.height))
             let lr = NSRect(x: size.width - l.width, y: 0, width: l.width, height: l.height)
             // hueco alrededor del candado para que no se confunda con el contorno del disco
             NSGraphicsContext.current?.compositingOperation = .destinationOut
-            NSBezierPath(roundedRect: lr.insetBy(dx: -1.2, dy: -1.2), xRadius: 2.5, yRadius: 2.5).fill()
+            NSBezierPath(roundedRect: lr.insetBy(dx: -1, dy: -1), xRadius: 2.5, yRadius: 2.5).fill()
             NSGraphicsContext.current?.compositingOperation = .sourceOver
             lock.draw(in: lr)
             return true
