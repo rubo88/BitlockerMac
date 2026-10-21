@@ -1,13 +1,15 @@
 #!/bin/bash
-# Desinstala bitlocker-menu (no toca macFUSE ni dislocker).
+# Uninstalls BitlockerMac. Leaves macFUSE, dislocker and ntfs-3g installed (remove them with brew).
 set -uo pipefail
-LABEL="io.github.rubo88.bitlocker-menu"
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
-rm -f "$HOME/Library/LaunchAgents/$LABEL.plist" "$HOME/.local/bin/bitlocker-menu"
-CACHE="$HOME/Library/Caches/bitlocker-menu"
+LABEL="io.github.rubo88.BitlockerMac"
+CACHE="$HOME/Library/Caches/BitlockerMac"
+
 if mount | grep -q " on $CACHE/"; then
-    echo "Hay un disco BitLocker abierto: expúlsalo antes. No borro $CACHE"
-else
-    rm -rf "$CACHE"
+    echo "A BitLocker drive is still open: eject it from the menu first. / Hay un disco BitLocker abierto: expúlsalo antes desde el menú."
+    exit 1
 fi
-echo "bitlocker-menu desinstalado. El registro sigue en ~/Library/Logs/bitlocker-menu.log"
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+rm -f "$HOME/Library/LaunchAgents/$LABEL.plist" "$HOME/.local/bin/BitlockerMac"
+rm -rf "$CACHE"
+echo "BitlockerMac uninstalled / desinstalado. Log / registro: ~/Library/Logs/BitlockerMac.log"
+echo "Dependencies / dependencias: brew uninstall gromgit/fuse/dislocker-mac gromgit/fuse/ntfs-3g-mac && brew uninstall --cask macfuse"
